@@ -1903,14 +1903,17 @@ def build_master_dataset(
             CASE
                 WHEN COALESCE(i.instance_count, 0) > 0
                 THEN
-                    CAST(
-                        COALESCE(
-                            s.telemetry_instance_count,
-                            0
+                    MIN(
+                        1.0,
+                        CAST(
+                            COALESCE(
+                                s.telemetry_instance_count,
+                                0
+                            )
+                            AS REAL
                         )
-                        AS REAL
+                        / i.instance_count
                     )
-                    / i.instance_count
                 ELSE 0.0
             END AS telemetry_coverage,
 

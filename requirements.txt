@@ -1,0 +1,42 @@
+# ============================================================
+# GPU-FinOps — Project Dependencies
+# ============================================================
+
+# Core data processing
+numpy>=1.26,<3
+pandas>=2.2,<3
+
+# Scientific computing / statistics
+scipy>=1.13,<2
+
+# Machine learning
+scikit-learn>=1.5,<2
+
+# Density-based clustering
+hdbscan>=0.8.38
+
+# Visualization
+matplotlib>=3.9,<4
+seaborn>=0.13,<1
+
+# Dimensionality reduction / visualization
+umap-learn>=0.5.6,<1
+
+# Progress / utility
+tqdm>=4.66,<5
+
+# Explainability
+shap>=0.46,<1
+
+# Gradient boosting / forecasting support
+xgboost>=2.1,<4
+
+# Configuration / environment
+python-dotenv>=1.0,<2
+
+# Jupyter support
+jupyter>=1.1,<2
+ipykernel>=6.29,<7
+
+# Model persistence
+joblib>=1.4,<2
