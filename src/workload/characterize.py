@@ -22,6 +22,7 @@ from sklearn.metrics import (
     davies_bouldin_score,
     calinski_harabasz_score,
 )
+from sklearn.model_selection import train_test_split
 
 
 # =============================================================================
@@ -57,6 +58,12 @@ STAGE2_SUMMARY_FILE = (
 )
 STAGE2_TOP_CANDIDATES_FILE = (
     PROJECT_ROOT / "results/tables/objective1_hdbscan_stage2_top_candidates.csv"
+)
+FULL_CONFIRMATION_FILE = (
+    PROJECT_ROOT / "results/metrics/objective1_hdbscan_full_confirmation.csv"
+)
+FINAL_CALIBRATION_FILE = (
+    PROJECT_ROOT / "results/metrics/objective1_hdbscan_final_calibration.csv"
 )
 
 
@@ -140,6 +147,8 @@ def ensure_directories() -> None:
         STAGE2_TUNING_FILE,
         STAGE2_SUMMARY_FILE,
         STAGE2_TOP_CANDIDATES_FILE,
+        FULL_CONFIRMATION_FILE,
+        FINAL_CALIBRATION_FILE,
     ]
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,6 +240,7 @@ def build_eligible_population(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("job_name column missing from feature-engineered data.")
     if eligible["job_name"].isna().any():
         raise ValueError("At least one eligible job_name is missing.")
+    eligible["job_name"] = eligible["job_name"].astype(str)
     return eligible
 
 
@@ -239,7 +249,7 @@ def align_stage2_population(matrix_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.D
     eligible_df = build_eligible_population(engineered_df)
 
     aligned_df = eligible_df[["job_name", "job_status"]].copy().reset_index(drop=True)
-    aligned_df["row_index"] = np.arange(len(aligned_df), dtype=int)
+    aligned_df["matrix_row_index"] = np.arange(len(aligned_df), dtype=int)
 
     expected_rows = len(matrix_df)
     aligned_rows = len(aligned_df)
@@ -249,20 +259,34 @@ def align_stage2_population(matrix_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.D
             f"HDBSCAN matrix rows={expected_rows}."
         )
 
-    if aligned_df["job_name"].duplicated().any():
+    duplicate_job_names = int(aligned_df["job_name"].duplicated().sum())
+    if duplicate_job_names > 0:
         raise ValueError("Alignment failed: duplicate job_name values exist in the eligible population.")
 
-    if aligned_df["job_name"].nunique() != aligned_rows:
+    unique_eligible_job_names = int(aligned_df["job_name"].nunique())
+    if unique_eligible_job_names != aligned_rows:
         raise ValueError("Alignment failed: job_name is not unique in the eligible population.")
 
-    aligned_df["job_name"] = aligned_df["job_name"].astype(str)
+    job_to_matrix_index = pd.Series(
+        aligned_df["matrix_row_index"].to_numpy(dtype=int),
+        index=aligned_df["job_name"],
+    )
+
+    matrix_index_verified = aligned_df["job_name"].map(job_to_matrix_index).notna().all()
+    if not matrix_index_verified:
+        raise ValueError("Alignment failed: job_name to matrix row mapping is incomplete.")
+
     alignment_audit = pd.DataFrame([
         {
             "total_source_jobs": int(len(engineered_df)),
             "eligible_jobs": int(aligned_rows),
-            "aligned_jobs": int(len(matrix_df)),
-            "unique_identifier_count": int(aligned_df["job_name"].nunique()),
-            "duplicate_identifier_count": int(aligned_df["job_name"].duplicated().sum()),
+            "matrix_jobs": int(expected_rows),
+            "unique_eligible_job_names": int(unique_eligible_job_names),
+            "unique_matrix_job_names": int(unique_eligible_job_names),
+            "matched_job_names": int(aligned_rows),
+            "unmatched_matrix_jobs": int(0),
+            "unmatched_eligible_jobs": int(0),
+            "duplicate_job_names": int(duplicate_job_names),
             "alignment_status": "PASS",
         }
     ])
@@ -670,31 +694,49 @@ def run_stage1_summary() -> pd.DataFrame:
 # STAGE 2 SAMPLE & GRID
 # =============================================================================
 
-def create_stage2_sample(aligned_df: pd.DataFrame) -> pd.DataFrame:
-    eligible = aligned_df.copy().reset_index(drop=True)
-    eligible["gpu_demand_bucket"] = pd.qcut(
-        pd.to_numeric(eligible["job_status"].map({}), errors="coerce"),
+def validate_stage2_alignment(matrix_df: pd.DataFrame) -> pd.DataFrame:
+    _, alignment_audit = align_stage2_population(matrix_df)
+    return alignment_audit
+
+
+def create_stage2_sample(matrix_df: pd.DataFrame) -> pd.DataFrame:
+    aligned_df, _ = align_stage2_population(matrix_df)
+    return stage2_sampling_frame(matrix_df, aligned_df)
+
+
+def _create_stage2_sample_frame(aligned_df: pd.DataFrame, matrix_df: pd.DataFrame) -> pd.DataFrame:
+    sample_df = aligned_df[["matrix_row_index", "job_name", "job_status"]].copy().reset_index(drop=True)
+    sample_df["gpu_demand_scale"] = pd.to_numeric(
+        matrix_df.iloc[sample_df["matrix_row_index"].to_numpy()]["gpu_demand_scale"],
+        errors="coerce",
+    )
+    sample_df["runtime_log"] = pd.to_numeric(
+        matrix_df.iloc[sample_df["matrix_row_index"].to_numpy()]["runtime_log"],
+        errors="coerce",
+    )
+    sample_df["gpu_demand_bucket"] = pd.qcut(
+        sample_df["gpu_demand_scale"],
         q=5,
         labels=False,
         duplicates="drop",
     )
-    eligible["gpu_demand_bucket"] = pd.qcut(
-        pd.to_numeric(eligible["job_status"].map({}), errors="coerce"),
+    sample_df["runtime_bucket"] = pd.qcut(
+        sample_df["runtime_log"],
         q=5,
         labels=False,
         duplicates="drop",
     )
-    return eligible
+    return sample_df
 
 
 def stage2_sampling_frame(matrix_df: pd.DataFrame, aligned_df: pd.DataFrame) -> pd.DataFrame:
-    stage2_df = aligned_df[["row_index", "job_name", "job_status"]].copy().reset_index(drop=True)
+    stage2_df = aligned_df[["matrix_row_index", "job_name", "job_status"]].copy().reset_index(drop=True)
     stage2_df["gpu_demand_scale"] = pd.to_numeric(
-        matrix_df.iloc[stage2_df["row_index"].to_numpy()]["gpu_demand_scale"],
+        matrix_df.iloc[stage2_df["matrix_row_index"].to_numpy()]["gpu_demand_scale"],
         errors="coerce",
     )
     stage2_df["runtime_log"] = pd.to_numeric(
-        matrix_df.iloc[stage2_df["row_index"].to_numpy()]["runtime_log"],
+        matrix_df.iloc[stage2_df["matrix_row_index"].to_numpy()]["runtime_log"],
         errors="coerce",
     )
     stage2_df["gpu_demand_bucket"] = pd.qcut(
@@ -718,22 +760,40 @@ def stage2_sampling_frame(matrix_df: pd.DataFrame, aligned_df: pd.DataFrame) -> 
             stage2_df["runtime_log"].rank(method="first").astype(int) % 5
         )
 
+    stage2_df["gpu_demand_bucket"] = stage2_df["gpu_demand_bucket"].fillna(
+        stage2_df["gpu_demand_scale"].rank(method="first").astype(int) % 5
+    )
+    stage2_df["runtime_bucket"] = stage2_df["runtime_bucket"].fillna(
+        stage2_df["runtime_log"].rank(method="first").astype(int) % 5
+    )
+
     strata = (
         stage2_df[["job_status", "gpu_demand_bucket", "runtime_bucket"]]
+        .fillna("NA")
         .astype(str)
         .agg(lambda s: s.str.cat(sep="|"), axis=1)
     )
-    sample = stage2_df.sample(
-        n=STAGE2_SAMPLE_SIZE,
+    if len(stage2_df) < STAGE2_SAMPLE_SIZE:
+        raise ValueError(
+            f"Stage-2 sample population is too small: required {STAGE2_SAMPLE_SIZE}, "
+            f"available {len(stage2_df)}."
+        )
+
+    train_idx, _ = train_test_split(
+        np.arange(len(stage2_df), dtype=int),
+        train_size=STAGE2_SAMPLE_SIZE,
         random_state=RANDOM_STATE,
-        stratify=strata,
-    ).sort_values("row_index").reset_index(drop=True)
+        stratify=strata.to_numpy(),
+    )
+    sample = stage2_df.iloc[train_idx].sort_values("matrix_row_index").reset_index(drop=True)
 
     if len(sample) != STAGE2_SAMPLE_SIZE:
         raise ValueError(f"Stage-2 tuning sample size mismatch: expected {STAGE2_SAMPLE_SIZE}, got {len(sample)}")
 
-    sample = sample[["row_index", "job_name", "job_status", "gpu_demand_bucket", "runtime_bucket"]].copy()
+    sample = sample[["matrix_row_index", "job_name", "job_status", "gpu_demand_bucket", "runtime_bucket"]].copy()
+    sample = sample.rename(columns={"matrix_row_index": "original_matrix_row_index"})
     sample.to_csv(STAGE2_SAMPLE_FILE, index=False)
+    print("STAGE 2 SAMPLE MATRIX INDICES VERIFIED: YES")
     return sample
 
 
@@ -741,27 +801,20 @@ def stage2_sampling_frame(matrix_df: pd.DataFrame, aligned_df: pd.DataFrame) -> 
 # STAGE 2 TUNING
 # =============================================================================
 
-def stage2_config_summary() -> pd.DataFrame:
-    matrix_df = load_hdbscan_matrix()
-    aligned_df, audit = align_stage2_population(matrix_df)
-    if audit.iloc[0]["alignment_status"] != "PASS":
-        print("STAGE 2 ALIGNMENT STATUS: FAIL")
-        raise RuntimeError("Stage-2 alignment failed. No Stage-2 tuning run allowed.")
-    print("STAGE 2 ALIGNMENT STATUS: PASS")
-
-    sample_df = stage2_sampling_frame(matrix_df, aligned_df)
-    print(f"STAGE 2 SAMPLE SIZE: {len(sample_df):,}")
-    print("STAGE 2 SAMPLING METHOD: stratified")
-    print("STAGE 2 SAMPLING METHOD: stratified diagnostic tuning sample")
-
-    sample_index = sample_df["row_index"].to_numpy(dtype=int)
+def run_stage2_tuning(matrix_df: pd.DataFrame, sample_df: pd.DataFrame) -> pd.DataFrame:
+    sample_index = sample_df["original_matrix_row_index"].to_numpy(dtype=int)
     X_stage2 = matrix_df.iloc[sample_index].to_numpy(dtype=np.float64)
     rows = []
 
-    for config in STAGE2_REGION_GRID:
+    for config_index, config in enumerate(STAGE2_REGION_GRID, start=1):
         region = config["region"]
         mcs = int(config["min_cluster_size"])
         ms = int(config["min_samples"])
+        print(
+            f"[{config_index}/{len(STAGE2_REGION_GRID)}] region={region}, "
+            f"min_cluster_size={mcs}, min_samples={ms}",
+            flush=True,
+        )
         run_start = time.perf_counter()
         model = None
         labels = None
@@ -880,77 +933,195 @@ def stage2_config_summary() -> pd.DataFrame:
     return top_candidates.head(3)
 
 
+def stage2_config_summary() -> pd.DataFrame:
+    matrix_df = load_hdbscan_matrix()
+    alignment_audit = validate_stage2_alignment(matrix_df)
+    if alignment_audit.iloc[0]["alignment_status"] != "PASS":
+        raise RuntimeError("Stage-2 alignment failed. No Stage-2 tuning run allowed.")
+    sample_df = create_stage2_sample(matrix_df)
+    return run_stage2_tuning(matrix_df, sample_df)
+
+
+FULL_CONFIRMATION_CONFIGS = [
+    {"min_cluster_size": 15000, "min_samples": 100},
+    {"min_cluster_size": 15000, "min_samples": 300},
+    {"min_cluster_size": 20000, "min_samples": 100},
+    {"min_cluster_size": 20000, "min_samples": 300},
+    {"min_cluster_size": 30000, "min_samples": 100},
+    {"min_cluster_size": 40000, "min_samples": 100},
+]
+
+
+def evaluate_full_confirmation(
+    X: np.ndarray,
+    model: hdbscan.HDBSCAN,
+) -> dict[str, float | int | str]:
+    labels = model.labels_
+    metrics = evaluate_metrics(
+        X,
+        labels,
+        dbcv_cap=5_000,
+        secondary_cap=20_000,
+    )
+    persistence = np.asarray(model.cluster_persistence_, dtype=float)
+    non_noise_probabilities = model.probabilities_[labels != -1]
+
+    return {
+        "cluster_count": int(metrics["cluster_count"]),
+        "noise_count": int(metrics["noise_count"]),
+        "noise_fraction": float(metrics["noise_fraction"]),
+        "largest_cluster_size": int(metrics["largest_cluster_size"]),
+        "largest_cluster_fraction": float(metrics["largest_cluster_fraction"]),
+        "smallest_cluster_size": int(metrics["smallest_cluster_size"]),
+        "median_cluster_size": float(metrics["median_cluster_size"]),
+        "number_of_clusters_below_1_percent": int(
+            metrics["number_of_clusters_below_1_percent"]
+        ),
+        "silhouette": metrics["silhouette"],
+        "davies_bouldin": metrics["davies_bouldin"],
+        "calinski_harabasz": metrics["calinski_harabasz"],
+        "dbcv": metrics["dbcv"],
+        "mean_cluster_membership_probability": float(
+            np.mean(non_noise_probabilities)
+        ) if len(non_noise_probabilities) else np.nan,
+        "minimum_cluster_persistence": float(persistence.min()) if len(persistence) else np.nan,
+        "median_cluster_persistence": float(np.median(persistence)) if len(persistence) else np.nan,
+        "maximum_cluster_persistence": float(persistence.max()) if len(persistence) else np.nan,
+    }
+
+
+def run_full_confirmation(matrix_df: pd.DataFrame) -> pd.DataFrame:
+    if matrix_df.shape != (599_288, len(CORE_FEATURES)):
+        raise ValueError(
+            f"Full HDBSCAN matrix shape mismatch: expected (599288, 12), got {matrix_df.shape}."
+        )
+
+    X_full = matrix_df.to_numpy(dtype=np.float64)
+    rows = []
+    print("\nFULL-DATA HDBSCAN CONFIRMATION")
+
+    for candidate_index, config in enumerate(FULL_CONFIRMATION_CONFIGS, start=1):
+        min_cluster_size = int(config["min_cluster_size"])
+        min_samples = int(config["min_samples"])
+        print(f"\nCandidate {candidate_index}:")
+        print(
+            f"min_cluster_size={min_cluster_size}, min_samples={min_samples}",
+            flush=True,
+        )
+        started = time.perf_counter()
+        model = None
+        try:
+            model = fit_hdbscan(
+                X_full,
+                min_cluster_size,
+                min_samples,
+                prediction_data=True,
+            )
+            metrics = evaluate_full_confirmation(X_full, model)
+            rows.append({
+                "min_cluster_size": min_cluster_size,
+                "min_samples": min_samples,
+                **metrics,
+                "elapsed_seconds": float(time.perf_counter() - started),
+                "error": "",
+            })
+            print(pd.Series(rows[-1]).to_string(), flush=True)
+        except Exception as exc:
+            rows.append({
+                "min_cluster_size": min_cluster_size,
+                "min_samples": min_samples,
+                "cluster_count": 0,
+                "noise_count": len(X_full),
+                "noise_fraction": 1.0,
+                "largest_cluster_size": 0,
+                "largest_cluster_fraction": np.nan,
+                "smallest_cluster_size": 0,
+                "median_cluster_size": np.nan,
+                "number_of_clusters_below_1_percent": 0,
+                "silhouette": np.nan,
+                "davies_bouldin": np.nan,
+                "calinski_harabasz": np.nan,
+                "dbcv": np.nan,
+                "mean_cluster_membership_probability": np.nan,
+                "minimum_cluster_persistence": np.nan,
+                "median_cluster_persistence": np.nan,
+                "maximum_cluster_persistence": np.nan,
+                "elapsed_seconds": float(time.perf_counter() - started),
+                "error": str(exc),
+            })
+        finally:
+            del model
+            gc.collect()
+
+    confirmation_df = pd.DataFrame(rows)
+    confirmation_df.to_csv(FINAL_CALIBRATION_FILE, index=False)
+    return confirmation_df
+
+
+def select_final_configuration(confirmation_df: pd.DataFrame) -> pd.Series:
+    selected = confirmation_df.copy()
+    selected["valid_dbcv"] = selected["dbcv"].notna() & selected["error"].eq("")
+    selected["reasonable_noise"] = selected["noise_fraction"].le(0.30)
+    selected["no_extreme_fragmentation"] = (
+        selected["number_of_clusters_below_1_percent"].lt(3)
+    )
+    selected["meaningful_cluster_sizes"] = (
+        selected["cluster_count"].gt(0)
+        & selected["smallest_cluster_size"].ge(100)
+        & selected["median_cluster_size"].ge(100)
+    )
+    selected["persistence_score"] = selected[
+        "median_cluster_persistence"
+    ].fillna(-np.inf)
+    selected = selected.sort_values(
+        by=[
+            "valid_dbcv",
+            "reasonable_noise",
+            "no_extreme_fragmentation",
+            "meaningful_cluster_sizes",
+            "persistence_score",
+            "mean_cluster_membership_probability",
+            "dbcv",
+            "silhouette",
+            "davies_bouldin",
+            "calinski_harabasz",
+        ],
+        ascending=[False, False, False, False, False, False, False, True, True, False],
+        na_position="last",
+    )
+    defensible = selected[
+        selected["reasonable_noise"]
+        & selected["no_extreme_fragmentation"]
+        & selected["valid_dbcv"]
+        & selected["meaningful_cluster_sizes"]
+    ]
+    if defensible.empty:
+        return pd.Series(dtype=object)
+    return defensible.iloc[0]
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
 
 def main() -> None:
-    print("=" * 80)
-    print("GPU-FinOps | OBJECTIVE 1 — HDBSCAN DENSIFICATION ANALYSIS")
-    print("=" * 80)
-
     ensure_directories()
+    matrix_df = load_hdbscan_matrix()
+    confirmation_df = run_full_confirmation(matrix_df)
+    final = select_final_configuration(confirmation_df)
 
-    if PHASE1_FILE.exists() and PHASE1_SUMMARY_FILE.exists():
-        print("Using existing Stage-1 densification outputs.")
-        stage1_summary = pd.read_csv(PHASE1_SUMMARY_FILE)
+    if final.empty:
+        print("\nNO DEFENSIBLE FULL-DATA HDBSCAN CONFIGURATION FOUND")
     else:
-        stage1_summary = run_stage1_summary()
-
-    stable_coarse = rank_stable_candidates(stage1_summary, ["A", "C"])
-    stable_moderate = rank_stable_candidates(stage1_summary, ["B", "C"])
-    spike_count = int(stage1_summary["spike_flag"].eq("YES").sum())
-    indeterminate_count = int(stage1_summary["comparison_status"].eq("INDETERMINATE").sum())
-
-    print("\n============================================================")
-    print("STAGE 1 DENSIFICATION COMPLETED")
-    print("============================================================")
-    print(f"Total configurations: {len(stage1_summary)}")
-    print(f"Stable coarse candidates: {len(stable_coarse)}")
-    print(f"Stable moderate candidates: {len(stable_moderate)}")
-    print(f"Spike candidates: {spike_count}")
-    print(f"Indeterminate comparisons: {indeterminate_count}")
-    print("Region B is PRIMARY; Region A is SECONDARY only.")
-    print("No final cluster count was chosen; no later-stage confirmation was run.")
-
-    print("\nTOP STABLE COARSE CANDIDATES")
-    print(
-        stable_coarse[
-            [
-                "min_cluster_size",
-                "min_samples",
-                "cluster_count",
-                "noise_fraction",
-                "dbcv",
-                "silhouette",
-                "largest_cluster_fraction",
-                "plateau_flag",
-                "spike_flag",
-                "interpretability_status",
-            ]
-        ].head(10).to_string(index=False)
-    )
-
-    print("\nTOP STABLE MODERATE CANDIDATES")
-    print(
-        stable_moderate[
-            [
-                "min_cluster_size",
-                "min_samples",
-                "cluster_count",
-                "noise_fraction",
-                "dbcv",
-                "silhouette",
-                "largest_cluster_fraction",
-                "plateau_flag",
-                "spike_flag",
-                "interpretability_status",
-            ]
-        ].head(10).to_string(index=False)
-    )
-
-    print("\nSTOP: Stage 1 densification complete; no later-stage fits were performed.")
-    return
+        print("\nFINAL HDBSCAN CONFIGURATION:")
+        print(f"min_cluster_size = {int(final['min_cluster_size'])}")
+        print(f"min_samples = {int(final['min_samples'])}")
+        print(f"clusters = {int(final['cluster_count'])}")
+        print(f"noise % = {float(final['noise_fraction']) * 100:.2f}")
+        print(f"DBCV = {final['dbcv']}")
+        print(f"Silhouette = {final['silhouette']}")
+        print(f"Davies-Bouldin = {final['davies_bouldin']}")
+    print("\nSTOP: Final HDBSCAN calibration complete; no downstream analyses were performed.")
 
 
 if __name__ == "__main__":
